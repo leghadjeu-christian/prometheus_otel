@@ -1,96 +1,101 @@
-use actix_web::{web, App, HttpServer, Responder};
+use actix_web::{web::{self, get}, App, HttpResponse, HttpServer, Responder};
 use opentelemetry::{
     global,
-    trace::{TraceContextExt, Tracer},
+    trace::{Tracer, TraceContextExt},
     KeyValue,
 };
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    logs::SdkLoggerProvider,
-    metrics::SdkMeterProvider,
-    trace::SdkTracerProvider,
-    Resource,
+    logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
 };
-use prometheus::{Encoder, IntCounter, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounter, Gauge, Registry, TextEncoder};
 use std::{error::Error, sync::OnceLock};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
+use sysinfo::{ProcessesToUpdate, System,  get_current_pid};
 
-use std::sync::Arc;
-
-static METRICS: OnceLock<Arc<Mutex<AppMetrics>>> = OnceLock::new();
+static RESOURCE: OnceLock<Resource> = OnceLock::new();
 
 fn get_resource() -> Resource {
-    static RESOURCE: OnceLock<Resource> = OnceLock::new();
     RESOURCE
-        .get_or_init(|| {
-            Resource::builder()
-                .with_service_name("otlp-actix-http-example")
-                .build()
-        })
-        .clone()
+    .get_or_init(|| {
+        Resource::builder()
+        .with_service_name("otlp-actix-http-example")
+        .build()
+    })
+    .clone()
 }
 
-// === Initialization Functions ===
 
 fn init_logs() -> SdkLoggerProvider {
     let exporter = LogExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .build()
-        .expect("Failed to create log exporter");
-
+    .with_http()
+    .with_endpoint("http://otel-collector:4318/v1/logs")        .with_protocol(Protocol::HttpBinary)
+    .build()
+    .expect("Failed to create log exporter");
+    
     SdkLoggerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(get_resource())
-        .build()
+    .with_batch_exporter(exporter)
+    .with_resource(get_resource())
+    .build()
 }
 
 fn init_traces() -> SdkTracerProvider {
     let exporter = SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .build()
-        .expect("Failed to create trace exporter");
-
+    .with_http()
+    .with_endpoint("http://otel-collector:4318/v1/traces")
+    .with_protocol(Protocol::HttpBinary)
+    .build()
+    .expect("Failed to create trace exporter");
+    
     SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(get_resource())
-        .build()
+    .with_batch_exporter(exporter)
+    .with_resource(get_resource())
+    .build()
 }
 
 fn init_metrics() -> SdkMeterProvider {
     let exporter = MetricExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .build()
-        .expect("Failed to create metric exporter");
-
+    .with_http()
+    .with_endpoint("http://otel-collector:4318")
+    .with_protocol(Protocol::HttpBinary)
+    .build()
+    .expect("Failed to create metric exporter");
+    
     SdkMeterProvider::builder()
-        .with_periodic_exporter(exporter)
-        .with_resource(get_resource())
-        .build()
+    .with_periodic_exporter(exporter)
+    .with_resource(get_resource())
+    .build()
 }
-
-// === Prometheus Metrics for /metrics endpoint ===
 
 #[derive(Debug)]
 struct AppMetrics {
     registry: Registry,
-    test_counter: IntCounter,
+    request_counter: IntCounter,
+    memory_gauge: Gauge,
+    cpu_gauge: Gauge,
 }
 
 impl AppMetrics {
     fn new() -> Self {
         let registry = Registry::new();
-        let test_counter = IntCounter::new("test_counter", "A simple counter").unwrap();
-        registry.register(Box::new(test_counter.clone())).unwrap();
-
+        
+        let request_counter = IntCounter::new("http_requests_total", "Number of HTTP requests").unwrap();
+        let memory_gauge = Gauge::new("app_memory_bytes", "Memory used by the app in bytes").unwrap();
+        let cpu_gauge = Gauge::new("app_cpu_percent", "CPU usage percent of the app").unwrap();
+        
+        registry.register(Box::new(request_counter.clone())).unwrap();
+        registry.register(Box::new(memory_gauge.clone())).unwrap();
+        registry.register(Box::new(cpu_gauge.clone())).unwrap();
+        
         Self {
             registry,
-            test_counter,
+            request_counter,
+            memory_gauge,
+            cpu_gauge,
         }
     }
 }
@@ -99,92 +104,99 @@ async fn metrics_handler(data: web::Data<Arc<Mutex<AppMetrics>>>) -> impl Respon
     let encoder = TextEncoder::new();
     let metrics = data.lock().await;
     let metric_families = metrics.registry.gather();
-
+    
     let mut buffer = Vec::new();
     encoder.encode(&metric_families, &mut buffer).unwrap();
-
-    String::from_utf8(buffer).unwrap()
+    
+    HttpResponse::Ok()
+    .content_type("text/plain; version=0.0.4")
+    .body(String::from_utf8(buffer).unwrap())
 }
 
-// === Main Function ===
+async fn index(metrics: web::Data<Arc<Mutex<AppMetrics>>>) -> impl Responder {
+    // Increment request count
+    {
+        let  metrics = metrics.lock().await;
+        metrics.request_counter.inc();
+    }
+    
+    HttpResponse::Ok().body("Hello! This request was counted.")
+}
+
+async fn update_system_metrics(metrics: Arc<Mutex<AppMetrics>>) {
+    let mut sys = System::new_all();
+    let pid = get_current_pid().unwrap().as_u32();
+    let get_pid= get_current_pid().unwrap();
+    let pid_array= [get_pid];
+    
+    loop {
+        sys.refresh_processes(ProcessesToUpdate::Some(&pid_array), true);
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        
+        if let Some(proc) = sys.process(sysinfo::Pid::from_u32(pid)) {
+            let  metrics = metrics.lock().await;
+            metrics.memory_gauge.set(proc.memory() as f64 / 1048576.0); // Bytes → Mb
+            metrics.cpu_gauge.set(proc.cpu_usage() as f64);
+        }
+        
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    // === Logs ===
     let logger_provider = init_logs();
     let otel_layer = OpenTelemetryTracingBridge::new(&logger_provider);
     let otel_layer = otel_layer.with_filter(
         EnvFilter::new("info")
-            .add_directive("hyper=off".parse().unwrap())
-            .add_directive("tonic=off".parse().unwrap())
-            .add_directive("h2=off".parse().unwrap())
-            .add_directive("reqwest=off".parse().unwrap()),
+        .add_directive("hyper=off".parse().unwrap())
+        .add_directive("tonic=off".parse().unwrap())
+        .add_directive("h2=off".parse().unwrap())
+        .add_directive("reqwest=off".parse().unwrap()),
     );
-
+    
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_thread_names(true)
-        .with_filter(EnvFilter::new("info").add_directive("opentelemetry=debug".parse().unwrap()));
-
+    .with_thread_names(true)
+    .with_filter(EnvFilter::new("info"));
+    
     tracing_subscriber::registry()
-        .with(otel_layer)
-        .with(fmt_layer)
-        .init();
-
-    // === Traces and Metrics ===
+    .with(otel_layer)
+    .with(fmt_layer)
+    .init();
+    
     let tracer_provider = init_traces();
     global::set_tracer_provider(tracer_provider.clone());
-
+    
     let meter_provider = init_metrics();
     global::set_meter_provider(meter_provider.clone());
-
-    // === Prometheus Counter ===
+    
     let app_metrics = Arc::new(Mutex::new(AppMetrics::new()));
-    METRICS.set(app_metrics.clone()).unwrap();
-
-    let app_metrics_clone = app_metrics.clone();
-    tokio::spawn(async move {
-        loop {
-            {
-                let mut metrics = app_metrics_clone.lock().await;
-                metrics.test_counter.inc();
-                info!("Incremented Prometheus counter");
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    });
-
-    // === Sample Trace ===
+    let metrics_clone = app_metrics.clone();
+    tokio::spawn(update_system_metrics(metrics_clone));
+    
     let tracer = global::tracer("example");
-    tracer.in_span("Main operation", |cx| {
+    tracer.in_span("startup", |cx| {
         let span = cx.span();
-        span.set_attribute(KeyValue::new("example.key", "value"));
-        info!("This is inside a traced span!");
+        span.set_attribute(KeyValue::new("app.startup", true));
+        info!("App is starting...");
     });
-
-    // === Actix Server ===
-    info!("Starting Actix-web server on http://0.0.0.0:4318/metrics");
-
+    
+    info!("Server running at http://0.0.0.0:8888");
+    
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(app_metrics.clone()))
-            .route("/metrics", web::get().to(metrics_handler))
+        .app_data(web::Data::new(app_metrics.clone()))
+        .route("/", web::get().to(index))
+        .route("/metrics", web::get().to(metrics_handler))
     })
     .bind(("0.0.0.0", 8888))?
     .run()
     .await?;
-
-    // === Shutdown ===
-    if let Err(e) = tracer_provider.shutdown() {
-        eprintln!("Tracer shutdown error: {e}");
-    }
-
-    if let Err(e) = meter_provider.shutdown() {
-        eprintln!("Meter shutdown error: {e}");
-    }
-
-    if let Err(e) = logger_provider.shutdown() {
-        eprintln!("Logger shutdown error: {e}");
-    }
-
+    
+    tracer_provider.shutdown()?;
+    meter_provider.shutdown()?;
+    logger_provider.shutdown()?;
+    
     Ok(())
 }
